@@ -16,6 +16,7 @@
 package retrofit2
 
 import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
@@ -24,6 +25,7 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AFTER_REQUEST
 import okhttp3.mockwebserver.SocketPolicy.NO_RESPONSE
 import org.assertj.core.api.Assertions.assertThat
+import org.junit.Assert
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Ignore
@@ -244,16 +246,9 @@ class KotlinSuspendTest {
           override fun responseType() = String::class.java
           override fun adapt(call: Call<String>): Call<String> {
             return object : Call<String> by call {
-              override fun enqueue(callback: Callback<String>) {
-                call.enqueue(object : Callback<String> by callback {
-                  override fun onResponse(call: Call<String>, response: Response<String>) {
-                    if (response.isSuccessful) {
-                      callback.onResponse(call, Response.success(response.body()?.repeat(5)))
-                    } else {
-                      callback.onResponse(call, response)
-                    }
-                  }
-                })
+              override fun execute(): Response<String> {
+                val response = call.execute()
+                return Response.success(response.body()?.repeat(5))
               }
             }
           }
@@ -272,5 +267,36 @@ class KotlinSuspendTest {
 
     val body = runBlocking { example.body() }
     assertThat(body).isEqualTo("HiHiHiHiHi")
+  }
+
+  @Test fun `ThreadContextElement works`() {
+    val threadLocal = ThreadLocal<String>()
+    val expectedValue = "1"
+    val threadLocalContextElement = threadLocal.asContextElement(expectedValue)
+    var interceptedValue: String? = null
+
+    val okHttpClient = OkHttpClient.Builder()
+      .addInterceptor { chain ->
+        interceptedValue = threadLocal.get()
+        chain.proceed(chain.request())
+      }
+      .build()
+    val retrofit = Retrofit.Builder()
+      .baseUrl(server.url("/"))
+      .client(okHttpClient)
+      .addConverterFactory(ToStringConverterFactory())
+      .build()
+    val example = retrofit.create(Service::class.java)
+
+    // This leaves the connection open indefinitely allowing us to cancel without racing a body.
+    server.enqueue(MockResponse().setBody("Hi"))
+
+    val deferred = GlobalScope.async(threadLocalContextElement) { example.body() }
+    runBlocking { deferred.await() }
+
+    // This will block until the server has received the request ensuring it's in flight.
+    server.takeRequest()
+
+    Assert.assertEquals(expectedValue, interceptedValue)
   }
 }

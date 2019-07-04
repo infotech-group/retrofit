@@ -15,83 +15,56 @@
  */
 
 @file:JvmName("KotlinExtensions")
+@file:Suppress("BlockingMethodInNonBlockingContext")
 
 package retrofit2
 
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 inline fun <reified T> Retrofit.create(): T = create(T::class.java)
 
 suspend fun <T : Any> Call<T>.await(): T {
-  return suspendCancellableCoroutine { continuation ->
-    continuation.invokeOnCancellation {
-      cancel()
-    }
-    enqueue(object : Callback<T> {
-      override fun onResponse(call: Call<T>, response: Response<T>) {
-        if (response.isSuccessful) {
-          val body = response.body()
-          if (body == null) {
-            val invocation = call.request().tag(Invocation::class.java)!!
-            val method = invocation.method()
-            val e = KotlinNullPointerException("Response from " +
-                method.declaringClass.name +
-                '.' +
-                method.name +
-                " was null but response body type was declared as non-null")
-            continuation.resumeWithException(e)
-          } else {
-            continuation.resume(body)
-          }
-        } else {
-          continuation.resumeWithException(HttpException(response))
-        }
-      }
+  val response = executeAsync()
+  val isSuccessful = response.isSuccessful
+  val body = response.body()
 
-      override fun onFailure(call: Call<T>, t: Throwable) {
-        continuation.resumeWithException(t)
-      }
-    })
+  when {
+    isSuccessful && body != null -> return body
+    !isSuccessful                -> throw HttpException(response)
+    else                         -> {
+      val invocation = request().tag(Invocation::class.java)!!
+      val method = invocation.method()
+      val nullResponseMessage = "Response from ${method.declaringClass.name}.${method.name} was null but response body type was declared as non-null"
+      throw KotlinNullPointerException(nullResponseMessage)
+    }
   }
 }
 
 @JvmName("awaitNullable")
 suspend fun <T : Any> Call<T?>.await(): T? {
-  return suspendCancellableCoroutine { continuation ->
-    continuation.invokeOnCancellation {
-      cancel()
-    }
-    enqueue(object : Callback<T?> {
-      override fun onResponse(call: Call<T?>, response: Response<T?>) {
-        if (response.isSuccessful) {
-          continuation.resume(response.body())
-        } else {
-          continuation.resumeWithException(HttpException(response))
-        }
-      }
+  this.execute()
+  val response = executeAsync()
+  val body = response.body()
 
-      override fun onFailure(call: Call<T?>, t: Throwable) {
-        continuation.resumeWithException(t)
-      }
-    })
+  when {
+    response.isSuccessful -> throw HttpException(response)
+    else                  -> return body
   }
 }
 
-suspend fun <T : Any> Call<T>.awaitResponse(): Response<T> {
-  return suspendCancellableCoroutine { continuation ->
-    continuation.invokeOnCancellation {
-      cancel()
-    }
-    enqueue(object : Callback<T> {
-      override fun onResponse(call: Call<T>, response: Response<T>) {
-        continuation.resume(response)
-      }
+suspend fun <T : Any> Call<T>.awaitResponse(): Response<T> = executeAsync()
 
-      override fun onFailure(call: Call<T>, t: Throwable) {
-        continuation.resumeWithException(t)
-      }
-    })
+private suspend fun <T> Call<T>.executeAsync(): Response<T> {
+  val call = this
+  return suspendCancellableCoroutine { continuation ->
+
+    continuation.invokeOnCancellation { call.cancel() }
+
+    CoroutineScope(continuation.context).launch {
+      val result = runCatching(call::execute)
+      continuation.resumeWith(result)
+    }
   }
 }
